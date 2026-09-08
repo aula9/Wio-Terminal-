@@ -1,13 +1,11 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
-
-#include <edge-impulse-sdk/classifier/ei_run_classifier.h>
-#include "model_variables.h"
+#include <Magnetic_Vision_1_inferencing.h>
 
 #define HALL_PIN A0
 #define SAMPLE_RATE_HZ 100
 #define SAMPLE_INTERVAL_MS (1000 / SAMPLE_RATE_HZ)
-#define TOTAL_SAMPLES 300
+#define TOTAL_SAMPLES EI_CLASSIFIER_RAW_SAMPLE_COUNT
 
 #define BTN_1 WIO_KEY_A
 #define BTN_2 WIO_KEY_B
@@ -30,6 +28,17 @@
 #define COLOR_BOX_BORDER TFT_BLUE
 
 TFT_eSPI tft = TFT_eSPI();
+
+static float* inference_buffer = nullptr;
+static size_t inference_buffer_len = 0;
+
+int inference_get_data(size_t offset, size_t length, float *out_ptr) {
+    if (offset + length > inference_buffer_len) {
+        return -1;
+    }
+    memcpy(out_ptr, inference_buffer + offset, length * sizeof(float));
+    return 0;
+}
 
 class SensorManager {
 private:
@@ -122,14 +131,13 @@ public:
 class UIManager {
 private:
   TFT_eSprite spr;
-  String currentClass;
   int lastRawValue;
   String inferenceResult;
   float confidence;
   bool isRecording;
 
 public:
-  UIManager() : spr(&tft), currentClass("READY"), lastRawValue(0), inferenceResult("--"), confidence(0.0), isRecording(false) {}
+  UIManager() : spr(&tft), lastRawValue(0), inferenceResult("--"), confidence(0.0), isRecording(false) {}
 
   void begin() {
     tft.init();
@@ -153,7 +161,6 @@ public:
     spr.setTextFont(2);
     spr.setTextSize(2);
     spr.drawString("AI Motion Detector", 10, 5);
-
     spr.drawLine(5, 35, 315, 35, TFT_DARKGREY);
 
     spr.setTextFont(2);
@@ -212,114 +219,10 @@ public:
   }
 };
 
-class InferenceEngine {
-private:
-  float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
-
-public:
-  void calculateFlattenFeatures(float* buffer, int length, float* output) {
-    if (length == 0) return;
-
-    float mean = 0;
-    for (int i = 0; i < length; i++) mean += buffer[i];
-    mean /= length;
-    output[0] = mean;
-
-    float variance = 0;
-    for (int i = 0; i < length; i++) {
-      float diff = buffer[i] - mean;
-      variance += diff * diff;
-    }
-    variance /= length;
-    float stddev = sqrt(variance);
-    output[1] = stddev;
-
-    float minVal = buffer[0];
-    for (int i = 1; i < length; i++) if (buffer[i] < minVal) minVal = buffer[i];
-    output[2] = minVal;
-
-    float maxVal = buffer[0];
-    for (int i = 1; i < length; i++) if (buffer[i] > maxVal) maxVal = buffer[i];
-    output[3] = maxVal;
-
-    float rms = 0;
-    for (int i = 0; i < length; i++) rms += buffer[i] * buffer[i];
-    rms = sqrt(rms / length);
-    output[4] = rms;
-
-    float skew = 0;
-    if (stddev > 0.0001) {
-      for (int i = 0; i < length; i++) {
-        float z = (buffer[i] - mean) / stddev;
-        skew += z * z * z;
-      }
-      skew /= length;
-    }
-    output[5] = skew;
-
-    float kurt = 0;
-    if (stddev > 0.0001) {
-      for (int i = 0; i < length; i++) {
-        float z = (buffer[i] - mean) / stddev;
-        kurt += z * z * z * z;
-      }
-      kurt /= length;
-      kurt -= 3;
-    }
-    output[6] = kurt;
-  }
-
-  String runInference(float* sampleBuffer, int sampleCount, float &outConfidence) {
-    if (sampleCount != TOTAL_SAMPLES) {
-      outConfidence = 0.0;
-      return "ERROR";
-    }
-
-    float features[7];
-    calculateFlattenFeatures(sampleBuffer, TOTAL_SAMPLES, features);
-
-    ei_impulse_result_t result = { 0 };
-    ei_impulse_handle_t *impulse = &ei_default_impulse;
-
-    signal_t signal;
-    signal.total_length = 7;
-    signal.get_data = [](size_t offset, size_t length, float *out_ptr, void *user_data) -> int {
-      float* features = (float*)user_data;
-      for (size_t i = 0; i < length; i++) {
-        out_ptr[i] = features[offset + i];
-      }
-      return 0;
-    };
-    signal.user_data = features;
-
-    int ret = ei_run_classifier(&signal, &result, false);
-    if (ret != 0) {
-      outConfidence = 0.0;
-      return "ERROR";
-    }
-
-    float maxConf = 0.0;
-    int maxIdx = -1;
-    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-      if (result.classification[i].value > maxConf) {
-        maxConf = result.classification[i].value;
-        maxIdx = i;
-      }
-    }
-    outConfidence = maxConf;
-    if (maxIdx >= 0) {
-      return String(result.classification[maxIdx].label);
-    } else {
-      return "UNKNOWN";
-    }
-  }
-};
-
 SensorManager sensorManager;
 ButtonManager buttonManager;
 BuzzerManager buzzerManager;
 UIManager uiManager;
-InferenceEngine inferenceEngine;
 
 bool isRecording = false;
 String currentResult = "--";
@@ -336,6 +239,9 @@ void setup() {
 
   uiManager.update(0, false, "READY", 0.0);
   Serial.println("AI Motion Detector ready. Press B1 to start.");
+  Serial.print("Expecting ");
+  Serial.print(TOTAL_SAMPLES);
+  Serial.println(" samples per inference.");
 }
 
 void loop() {
@@ -383,21 +289,72 @@ void loop() {
       isRecording = false;
       sensorManager.stopCollection();
 
+      inference_buffer = sensorManager.getSampleBuffer();
+      inference_buffer_len = sensorManager.getSampleCount();
+
+      // تم حذف استدعاء run_classifier_init() لأنه لا حاجة له
+
       float* buffer = sensorManager.getSampleBuffer();
       int count = sensorManager.getSampleCount();
-      float confidence = 0.0;
-      String result = inferenceEngine.runInference(buffer, count, confidence);
 
-      currentResult = result;
-      currentConfidence = confidence;
+      float mean = 0;
+      for (int i = 0; i < count; i++) mean += buffer[i];
+      mean /= count;
 
-      uiManager.update(raw, false, result, confidence);
-      buzzerManager.beep(2000, 200);
-      Serial.print("Inference result: ");
-      Serial.print(result);
-      Serial.print(" (Confidence: ");
-      Serial.print(confidence);
-      Serial.println(")");
+      float variance = 0;
+      for (int i = 0; i < count; i++) {
+        float diff = buffer[i] - mean;
+        variance += diff * diff;
+      }
+      variance /= count;
+      float stddev = sqrt(variance);
+
+      float minVal = 10000, maxVal = -10000;
+      for (int i = 0; i < count; i++) {
+        if (buffer[i] < minVal) minVal = buffer[i];
+        if (buffer[i] > maxVal) maxVal = buffer[i];
+      }
+
+      Serial.print("Min: "); Serial.print(minVal);
+      Serial.print("  Max: "); Serial.print(maxVal);
+      Serial.print("  Mean: "); Serial.print(mean);
+      Serial.print("  Std: "); Serial.println(stddev);
+
+      ei_impulse_result_t result = { 0 };
+      signal_t features_signal;
+      features_signal.total_length = inference_buffer_len;
+      features_signal.get_data = std::function<int(size_t, size_t, float*)>(&inference_get_data);
+
+      EI_IMPULSE_ERROR res = run_classifier(&features_signal, &result, false);
+      
+      if (res != EI_IMPULSE_OK) {
+        currentResult = "ERR";
+        currentConfidence = 0.0;
+        uiManager.update(raw, false, "ERROR", 0.0);
+        Serial.print("ERR: Classifier failed (");
+        Serial.print(res);
+        Serial.println(")");
+      } else {
+        float maxConf = 0.0;
+        int maxIdx = -1;
+        for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+          if (result.classification[i].value > maxConf) {
+            maxConf = result.classification[i].value;
+            maxIdx = i;
+          }
+        }
+
+        currentResult = (maxIdx >= 0) ? String(result.classification[maxIdx].label) : "UNKNOWN";
+        currentConfidence = maxConf;
+
+        uiManager.update(raw, false, currentResult, currentConfidence);
+        buzzerManager.beep(2000, 200);
+        Serial.print("Inference result: ");
+        Serial.print(currentResult);
+        Serial.print(" (Confidence: ");
+        Serial.print(currentConfidence);
+        Serial.println(")");
+      }
     }
 
     if (!isRecording && !sensorManager.isCollectingSamples()) {
